@@ -5,3 +5,5 @@ MODIS 36 band
 old codes location
 /mnt/efs_clavrx/ywang/gitrepo/rroci/rrociModule/
 
+MODIS Band
+
