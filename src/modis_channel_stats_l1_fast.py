@@ -28,7 +28,7 @@ from pyhdf.SD import SD, SDC
 CHANNELS = [3, 1, 2, 26, 6, 7, 20, 29, 31, 32, 33]
 
 # User-provided upper clip limits, aligned to CHANNELS order above
-UPPER_CLIP_LIST = [550, 425, 225, 40, 20, 10, 1.5, 14, 14, 10, 12]
+UPPER_CLIP_LIST = [550, 425, 225, 40, 40, 10, 1.5, 14, 14, 10, 12]
 assert len(UPPER_CLIP_LIST) == len(CHANNELS), "UPPER_CLIP_LIST must match CHANNELS length"
 BAND_TO_UPPER_CLIP = dict(zip(CHANNELS, map(float, UPPER_CLIP_LIST)))
 
