@@ -4,18 +4,16 @@ modis_channel_stats_l1_v2.py
 
 Compute ONE combined statistic summary (median/min/max) across ALL files matching a glob.
 
-- ALL bands processed as RADIANCE via radiance_scales/radiance_offsets
-- Memory-safe: reads ONLY the requested band plane (hyperslab), not the full EV cube
+- ALL channels processed as RADIANCE via radiance_scales/radiance_offsets
+- Memory-safe: reads ONLY the requested band plane (hyperslab)
 - Masks fill/out-of-range using DN-space valid_range and _FillValue before scaling
 - Median is approximate via streaming histogram; min/max are exact
+- Uses per-channel upper clip limits for histogram range [0, upper_clip]
+- Reports N(>clip) and Pct(>clip)=100*N(>clip)/N(valid)
+- Adds columns: MODIS band number, MODIS band wavelength, SPECTRE band label
 
 Usage:
   python modis_channel_stats_l1_v2.py "/path/to/MYD021KM.A2019099.*.hdf"
-
-Examples:
-  python src/modis_channel_stats_l1_v2.py "/mnt/efs_clavrx/ywang/run/07272021/modisinput/day/MYD021KM.A2019099.*.hdf"
-  python src/modis_channel_stats_l1_v2.py "/mnt/efs_clavrx/ywang/run/07272021/modisinput/night/MYD021KM.A2019099.*.hdf"
-  python src/modis_channel_stats_l1_v2.py "/mnt/efs_clavrx/ywang/run/07272021/modisinput/*/MYD021KM.A2019100.*.hdf"
 """
 
 import sys
@@ -28,6 +26,31 @@ from pyhdf.SD import SD, SDC
 # Channels and mapping
 # -----------------------
 CHANNELS = [3, 1, 2, 26, 6, 7, 20, 29, 31, 32, 33]
+
+# User-provided upper clip limits, aligned to CHANNELS order above
+UPPER_CLIP_LIST = [550, 425, 225, 40, 20, 10, 1.5, 14, 14, 10, 12]
+assert len(UPPER_CLIP_LIST) == len(CHANNELS), "UPPER_CLIP_LIST must match CHANNELS length"
+BAND_TO_UPPER_CLIP = dict(zip(CHANNELS, map(float, UPPER_CLIP_LIST)))
+
+# User-provided SPECTRE band labels, aligned to CHANNELS order above
+SPECTRE_LIST = ["A", "1", "2", "3", "4", "B", "5", "6", "7", "C", "8"]
+assert len(SPECTRE_LIST) == len(CHANNELS), "SPECTRE_LIST must match CHANNELS length"
+BAND_TO_SPECTRE = dict(zip(CHANNELS, SPECTRE_LIST))
+
+# MODIS band wavelength ranges (µm), keyed by MODIS band number
+BAND_TO_WAVELENGTH_UM = {
+    1:  "0.620–0.670",
+    2:  "0.841–0.876",
+    3:  "0.459–0.479",
+    6:  "1.628–1.652",
+    7:  "2.105–2.155",
+    20: "3.660–3.840",
+    26: "1.360–1.390",
+    29: "8.400–8.700",
+    31: "10.780–11.280",
+    32: "11.770–12.270",
+    33: "13.185–13.485",
+}
 
 # band -> (SDS name, 0-based index within SDS)
 BAND_TO_SDS = {
@@ -44,29 +67,16 @@ BAND_TO_SDS = {
     33: ("EV_1KM_Emissive", 12),
 }
 
-def is_thermal_band(b: int) -> bool:
-    return 20 <= b <= 36
-
-# -----------------------
-# Histogram settings (for approximate median)
-# -----------------------
+# Histogram settings (approx median)
 HIST_NBINS = 4096
-
-# Ranges are used ONLY for histogram-median; min/max are exact.
-# Widen if you see clipping counts reported.
-RADIANCE_RANGE_RSB = (0.0, 800.0)  # reflective solar bands radiance can be large
-RADIANCE_RANGE_TEB = (0.0, 40.0)   # thermal emissive typical; widen if needed
+HIST_LOWER = 0.0  # radiance lower bound for histogram range
 
 
 # -----------------------
 # HDF helpers
 # -----------------------
 def read_band_plane(sds, band_idx0: int) -> np.ndarray:
-    """
-    Read a single band plane from a 3D EV SDS using hyperslab.
-    Expected order for MODIS EV: [band, row, col].
-    Returns DN as float32 2D array (row, col).
-    """
+    """Read a single band plane from a 3D EV SDS using hyperslab."""
     name, rank, dims, dtype, nattrs = sds.info()
     if rank != 3:
         raise RuntimeError(f"SDS {name} expected rank=3, got rank={rank}, dims={dims}")
@@ -78,6 +88,7 @@ def read_band_plane(sds, band_idx0: int) -> np.ndarray:
     dn = sds.get(start=(band_idx0, 0, 0), count=(1, nr, nc))
     dn = np.asarray(dn, dtype=np.float32).squeeze(axis=0)  # -> (nr, nc)
     return dn
+
 
 def calibrated_radiance_2d(hdf: SD, sds_name: str, band_idx0: int) -> np.ndarray:
     """
@@ -127,14 +138,15 @@ class RunningStatsWithHistMedian:
         self.hmax = float(hmax)
         self.nbins = int(nbins)
         if not (self.hmax > self.hmin):
-            raise ValueError("Histogram range must have hmax > hmin")
+            raise ValueError(f"Histogram range invalid: [{self.hmin},{self.hmax}]")
 
         self.hist = np.zeros(self.nbins, dtype=np.int64)
         self.count = 0
         self.vmin = np.inf
         self.vmax = -np.inf
+
         self.clipped_low = 0
-        self.clipped_high = 0
+        self.clipped_high = 0  # N(>clip)
 
     def update(self, arr2d: np.ndarray):
         vals = arr2d[np.isfinite(arr2d)]
@@ -167,11 +179,10 @@ class RunningStatsWithHistMedian:
         bin_width = (self.hmax - self.hmin) / self.nbins
         return float(self.hmin + (idx + 0.5) * bin_width)
 
-    def hist_range_str(self) -> str:
-        s = f"[{self.hmin:g},{self.hmax:g}]"
-        if self.clipped_low or self.clipped_high:
-            s += f" clipped(<)={self.clipped_low} clipped(>)={self.clipped_high}"
-        return s
+    def pct_clipped_high(self) -> float:
+        if self.count == 0:
+            return np.nan
+        return 100.0 * float(self.clipped_high) / float(self.count)
 
 
 # -----------------------
@@ -179,7 +190,7 @@ class RunningStatsWithHistMedian:
 # -----------------------
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python modis_channel_stats_l1_v2.py \"/path/pattern/MYD021KM.A2019099.*.hdf\"")
+        print('Usage: python modis_channel_stats_l1_v2.py "/path/to/MYD021KM.A2019099.*.hdf"')
         sys.exit(2)
 
     pattern = sys.argv[1]
@@ -188,7 +199,6 @@ def main():
         raise SystemExit(f"No files matched: {pattern}")
 
     acc = {}
-
     n_open_fail = 0
     n_warn_files = 0
 
@@ -201,7 +211,6 @@ def main():
             continue
 
         file_warn = False
-
         for band in CHANNELS:
             sds_name, bidx0 = BAND_TO_SDS[band]
             try:
@@ -212,32 +221,50 @@ def main():
                 continue
 
             if band not in acc:
-                hmin, hmax = (RADIANCE_RANGE_TEB if is_thermal_band(band) else RADIANCE_RANGE_RSB)
-                acc[band] = RunningStatsWithHistMedian(hmin=hmin, hmax=hmax, nbins=HIST_NBINS)
-
+                acc[band] = RunningStatsWithHistMedian(
+                    hmin=HIST_LOWER,
+                    hmax=BAND_TO_UPPER_CLIP[band],
+                    nbins=HIST_NBINS,
+                )
             acc[band].update(rad)
 
         if file_warn:
             n_warn_files += 1
 
     # Output
-    print("\n" + "=" * 104)
+    print("\n" + "=" * 164)
     print(f"Pattern: {pattern}")
     print(f"Files matched: {len(files)} | open failures: {n_open_fail} | files w/ warnings: {n_warn_files}")
     print("All channels processed as RADIANCE via radiance_scales/radiance_offsets.")
-    print(f"Median: histogram-approx ({HIST_NBINS} bins). Min/Max: exact.")
-    print("=" * 104 + "\n")
+    print(f"Median: histogram-approx ({HIST_NBINS} bins) over [0, upper_clip]. Min/Max: exact.")
+    print("=" * 164 + "\n")
 
-    print(f"{'Band':>4}  {'median':>14}  {'min':>14}  {'max':>14}  {'N(valid)':>12}  {'HistRange':>34}")
-    print("-" * 96)
+    print(
+        f"{'MODIS':>5}  {'SPECTRE':>7}  {'Wavelength(µm)':>15}  "
+        f"{'upper_clip':>10}  {'median':>14}  {'min':>14}  {'max':>14}  "
+        f"{'N(valid)':>12}  {'N(>clip)':>10}  {'Pct(>clip)':>11}"
+    )
+    print("-" * 160)
 
     for band in CHANNELS:
+        spectre = BAND_TO_SPECTRE.get(band, "-")
+        wl = BAND_TO_WAVELENGTH_UM.get(band, "unknown")
+
         if band not in acc or acc[band].count == 0:
-            print(f"{band:>4}  {'nan':>14}  {'nan':>14}  {'nan':>14}  {0:>12}  {'-':>34}")
+            print(
+                f"{band:>5}  {spectre:>7}  {wl:>15}  "
+                f"{BAND_TO_UPPER_CLIP[band]:>10g}  {'nan':>14}  {'nan':>14}  {'nan':>14}  "
+                f"{0:>12}  {0:>10}  {'nan':>11}"
+            )
             continue
 
         a = acc[band]
-        print(f"{band:>4}  {a.median():>14.6g}  {a.vmin:>14.6g}  {a.vmax:>14.6g}  {a.count:>12d}  {a.hist_range_str():>34}")
+        print(
+            f"{band:>5}  {spectre:>7}  {wl:>15}  "
+            f"{a.hmax:>10g}  {a.median():>14.6g}  {a.vmin:>14.6g}  {a.vmax:>14.6g}  "
+            f"{a.count:>12d}  {a.clipped_high:>10d}  {a.pct_clipped_high():>10.6g}%"
+        )
+
 
 if __name__ == "__main__":
     main()
