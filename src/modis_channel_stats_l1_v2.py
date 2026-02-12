@@ -157,7 +157,8 @@ def parse_args():
         description="Compute one aggregated summary for selected MYD021KM channels across all matching HDF files."
     )
     parser.add_argument(
-        "--pattern",
+        "pattern",
+        nargs="?",
         default=DEFAULT_PATTERN,
         help=f"Input file glob pattern (default: {DEFAULT_PATTERN})",
     )
